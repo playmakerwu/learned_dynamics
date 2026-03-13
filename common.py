@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,13 @@ def build_env_cfg(task: str, device: str, num_envs: int, disable_fabric: bool, s
     )
     if seed is not None and hasattr(env_cfg, "seed"):
         env_cfg.seed = seed
+    if hasattr(env_cfg, "scene") and hasattr(env_cfg.scene, "num_envs"):
+        env_cfg.scene.num_envs = num_envs
+        # Fabric cloning is unnecessary for a single env and can be brittle on some setups.
+        if num_envs <= 1 and hasattr(env_cfg.scene, "clone_in_fabric"):
+            env_cfg.scene.clone_in_fabric = False
+    if disable_fabric and hasattr(env_cfg, "scene") and hasattr(env_cfg.scene, "clone_in_fabric"):
+        env_cfg.scene.clone_in_fabric = False
     return env_cfg
 
 
@@ -97,6 +105,9 @@ def patch_rl_games_cfg(
     minibatch_size: int | None = None,
     games_num: int | None = None,
     deterministic: bool = True,
+    render: bool | None = None,
+    render_sleep: float | None = None,
+    print_stats: bool | None = None,
 ) -> dict:
     safe_set(agent_cfg, ["params", "seed"], seed)
     safe_set(agent_cfg, ["params", "config", "env_name"], "rlgpu")
@@ -124,6 +135,12 @@ def patch_rl_games_cfg(
     safe_set(agent_cfg, ["params", "config", "player", "use_vecenv"], True)
     safe_set(agent_cfg, ["params", "config", "player", "games_num"], games_num or num_envs)
     safe_set(agent_cfg, ["params", "config", "player", "deterministic"], deterministic)
+    if render is not None:
+        safe_set(agent_cfg, ["params", "config", "player", "render"], render)
+    if render_sleep is not None:
+        safe_set(agent_cfg, ["params", "config", "player", "render_sleep"], render_sleep)
+    if print_stats is not None:
+        safe_set(agent_cfg, ["params", "config", "player", "print_stats"], print_stats)
 
     return agent_cfg
 
@@ -175,16 +192,71 @@ def register_rl_games_env(
     return created_envs
 
 
-def latest_checkpoint(search_root: Path, run_name: str | None = None) -> Path:
+def checkpoint_is_valid(path: Path) -> tuple[bool, str | None]:
+    path = Path(path)
+    if not path.is_file():
+        return False, "file does not exist"
+    try:
+        with zipfile.ZipFile(path) as zf:
+            bad_member = zf.testzip()
+            if bad_member is not None:
+                return False, f"zip member is corrupted: {bad_member}"
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def list_checkpoints(search_root: Path, run_name: str | None = None) -> list[Path]:
     search_root = Path(search_root)
-    candidates = []
+    candidates: list[Path] = []
     for path in search_root.rglob("*.pth"):
         if run_name is not None and run_name not in path.parts:
             continue
         candidates.append(path)
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def latest_checkpoint(search_root: Path, run_name: str | None = None, require_valid: bool = False) -> Path:
+    candidates = list_checkpoints(search_root, run_name=run_name)
     if not candidates:
         raise FileNotFoundError(f"No .pth checkpoint found under: {search_root}")
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    if not require_valid:
+        return candidates[0]
+
+    invalid_reasons = []
+    for candidate in candidates:
+        is_valid, reason = checkpoint_is_valid(candidate)
+        if is_valid:
+            return candidate
+        invalid_reasons.append(f"{candidate}: {reason}")
+
+    details = "\n".join(invalid_reasons[:5])
+    raise FileNotFoundError(
+        "No valid .pth checkpoint found under "
+        f"{search_root}. Invalid candidates:\n{details}"
+    )
+
+
+def configure_rl_games_checkpoint_loading(map_location: str | None) -> None:
+    from rl_games.algos_torch import torch_ext
+
+    if not map_location:
+        return
+
+    def safe_load(filename):
+        return torch_ext.safe_filesystem_op(
+            torch.load,
+            filename,
+            map_location=map_location,
+            weights_only=False,
+        )
+
+    def load_checkpoint(filename):
+        print(f"=> loading checkpoint '{filename}' (map_location={map_location})")
+        return safe_load(filename)
+
+    torch_ext.safe_load = safe_load
+    torch_ext.load_checkpoint = load_checkpoint
 
 
 def mirror_checkpoints(src_root: Path, dst_root: Path) -> list[Path]:

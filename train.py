@@ -40,6 +40,7 @@ def main():
 
     from common import (
         build_env_cfg,
+        configure_rl_games_checkpoint_loading,
         latest_checkpoint,
         load_rl_games_cfg,
         mirror_checkpoints,
@@ -84,6 +85,9 @@ def main():
     save_yaml(run_root / "resolved_env_cfg.yaml", env_cfg)
     save_yaml(run_root / "resolved_agent_cfg.yaml", agent_cfg)
     save_yaml(run_root / "cli_args.yaml", vars(args))
+
+    if args.checkpoint:
+        configure_rl_games_checkpoint_loading(args.device)
 
     created_envs = register_rl_games_env(
         args.task,
