@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+import torch
 import yaml
 
 DEFAULT_TASK = "Isaac-Factory-PegInsert-Direct-v0"
@@ -79,6 +80,98 @@ def build_env_cfg(task: str, device: str, num_envs: int, disable_fabric: bool, s
     if disable_fabric and hasattr(env_cfg, "scene") and hasattr(env_cfg.scene, "clone_in_fabric"):
         env_cfg.scene.clone_in_fabric = False
     return env_cfg
+
+
+def _collect_usd_paths(obj: Any, *, _seen: set[int] | None = None, _paths: list[str] | None = None) -> list[str]:
+    if _seen is None:
+        _seen = set()
+    if _paths is None:
+        _paths = []
+
+    if obj is None:
+        return _paths
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return _paths
+    _seen.add(obj_id)
+
+    if isinstance(obj, str):
+        if obj.endswith(".usd") and obj not in _paths:
+            _paths.append(obj)
+        return _paths
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            _collect_usd_paths(value, _seen=_seen, _paths=_paths)
+        return _paths
+
+    if isinstance(obj, (list, tuple, set)):
+        for value in obj:
+            _collect_usd_paths(value, _seen=_seen, _paths=_paths)
+        return _paths
+
+    if dataclasses.is_dataclass(obj):
+        for field in dataclasses.fields(obj):
+            _collect_usd_paths(getattr(obj, field.name), _seen=_seen, _paths=_paths)
+        return _paths
+
+    if hasattr(obj, "__dict__"):
+        for key, value in vars(obj).items():
+            if key.startswith("_"):
+                continue
+            _collect_usd_paths(value, _seen=_seen, _paths=_paths)
+
+    return _paths
+
+
+def _extra_usd_paths_for_task(task: str) -> list[str]:
+    if not task.startswith("Isaac-Factory-"):
+        return []
+
+    from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+    return [
+        f"{ISAAC_NUCLEUS_DIR}/Environments/Grid/default_environment.usd",
+        f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd",
+    ]
+
+
+def ensure_task_assets_available(task: str, env_cfg) -> None:
+    from isaaclab.utils.assets import check_file_path
+
+    usd_paths = _collect_usd_paths(env_cfg)
+    usd_paths.extend(path for path in _extra_usd_paths_for_task(task) if path not in usd_paths)
+
+    missing_paths: list[str] = []
+    for path in usd_paths:
+        try:
+            status = check_file_path(path)
+        except Exception:
+            status = 0
+        if status == 0:
+            missing_paths.append(path)
+
+    if not missing_paths:
+        return
+
+    details = "\n".join(f" - {path}" for path in missing_paths[:8])
+    if len(missing_paths) > 8:
+        details += f"\n - ... and {len(missing_paths) - 8} more"
+
+    raise FileNotFoundError(
+        "Required USD assets are not reachable for this task.\n"
+        f"Task: {task}\n"
+        "Missing assets:\n"
+        f"{details}\n\n"
+        "Isaac Lab 5.1 assets are hosted on AWS S3 by default. This usually means either:\n"
+        "  1. the machine cannot reach the cloud asset server right now, or\n"
+        "  2. the assets are not cached locally yet.\n\n"
+        "Recommended fix:\n"
+        "  - Launch Isaac Lab once with GUI via `./isaaclab.sh -s` and enable CACHE/Hub.\n"
+        "  - Ensure the machine can access the cloud asset root.\n"
+        "  - Retry the command after the assets are cached.\n"
+    )
 
 
 def load_rl_games_cfg(task: str) -> dict:

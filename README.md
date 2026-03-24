@@ -1,0 +1,516 @@
+# NeRD Peg-Insert Pipeline
+
+Neural Robot Dynamics (NeRD) applied to the Isaac Lab Factory peg-insert task.
+The goal is to train a data-driven dynamics model (NeRD) on high-fidelity
+solver=192 simulator trajectories, then evaluate whether it can predict dynamics
+more accurately than a rough solver=24 simulator baseline.
+
+## Pipeline Overview
+
+```
+1. Collect trajectories   (Isaac Lab + RL-Games policy → HDF5)
+2. Convert dataset        (collector format → NeRD training format)
+3. Split dataset          (stratified train/test split)
+4. Train NeRD             (transformer-based dynamics model)
+5. Collect eval data      (solver=24 and solver=192 trajectories)
+6. NeRD rollout           (autoregressive inference from solver=24 initial states)
+7. Compare                (solver24 vs NeRD vs solver192 reference)
+```
+
+## What Was Fixed (v2)
+
+The original pipeline had several correctness issues in state representation and
+frame handling. This version fixes them:
+
+1. **Quaternion-aware targets.** The original target was `next_states - states`
+   (naive subtraction), which is wrong for quaternions. Fixed: quaternion
+   channels now use `delta = q_to * conj(q_from)` with reconstruction via
+   `q_next = delta * q_from`. Non-quaternion channels still use subtraction.
+
+2. **Body-frame conversion.** The original pipeline fed world-frame positions
+   directly, making the model memorize absolute coordinates. Fixed: all
+   positions, velocities, and orientations are converted to a body frame
+   anchored at `root_body_q` (the held peg's pose) before feeding to the model.
+   The rollout reconstructs world-frame states after each prediction.
+
+3. **Contact masking.** Inactive contact slots (beyond `contact_counts`) could
+   contain stale data. Fixed: inactive slots are zeroed out before training and
+   inference.
+
+4. **Frame-correct rollout evaluation.** The rollout now: extracts the anchor
+   from the predicted world-frame state, converts to body frame, runs the model,
+   and reconstructs back to world frame using the correct anchor.
+
+New files: `nerd_bridge/frame_utils.py`, `nerd_bridge/preprocessing.py`,
+`tests/test_frame_utils.py`, `tests/test_preprocessing.py`.
+
+Modified files: `nerd_bridge/training.py`, `rollout_nerd_eval.py`.
+
+## Frame Conventions
+
+All code uses the **[w, x, y, z]** quaternion convention (scalar-first),
+matching Isaac Lab. This is enforced throughout `frame_utils.py`.
+
+### World frame vs body frame
+
+- **World frame** (a.k.a. local frame): Isaac Lab world frame (z-up). Positions
+  in the dataset are already local (world - env_origin).
+- **Body frame**: Anchored at `root_body_q` = `(held_root_pos_local,
+  held_root_quat_wxyz)`. The held peg's position becomes the origin and its
+  orientation becomes identity.
+
+### Body-frame conversion rules
+
+| Field type | Transform (world → body) | Inverse (body → world) |
+|------------|--------------------------|------------------------|
+| Position   | `p_body = R(q)^-1 (p_world - pos)` | `p_world = R(q) p_body + pos` |
+| Free vector (velocity, gravity) | `v_body = R(q)^-1 v_world` | `v_world = R(q) v_body` |
+| Quaternion orientation | `q_body = conj(anchor_q) * q_world` | `q_world = anchor_q * q_body` |
+| Joint positions/velocities | No transform (already joint-local) | No transform |
+
+### Anchoring strategy
+
+**"Every" anchoring**: each timestep uses its own `root_body_q` as anchor. This
+matches the official NeRD default and makes the learning problem translation-
+and rotation-invariant.
+
+### Quaternion target representation
+
+For orientation fields, the model predicts a **quaternion delta** `d` such that:
+```
+q_next = normalize(positive_w(d * q_current))
+```
+where `d = positive_w(normalize(q_next * conj(q_current)))`. The delta is always
+in canonical form (w >= 0) to avoid double-cover discontinuities.
+
+## Directory Structure
+
+```
+learned_dynamics/
+├── common.py                         # Isaac Lab / RL-Games environment helpers
+├── nerd_collector/                    # Trajectory collection package
+│   ├── config.py                     #   collector configuration dataclass
+│   ├── collector.py                  #   core collector (env stepping, state assembly, HDF5 writing)
+│   ├── contact_utils.py              #   fixed-slot contact projection utilities
+│   ├── physx_contact_report.py       #   low-level PhysX contact report extractor
+│   ├── hdf5_utils.py                 #   HDF5 trajectory writer
+│   └── net_contact_force.py          #   GPU-compatible net force extractor (alternative path)
+├── nerd_bridge/                      # NeRD training bridge package
+│   ├── common.py                     #   shared constants, path helpers, NeRD import setup
+│   ├── dataset_utils.py              #   HDF5 inspection, conversion, split utilities
+│   ├── frame_utils.py                #   quaternion arithmetic and rigid-body frame conversions
+│   ├── preprocessing.py              #   body-frame conversion, targets, contact masking
+│   └── training.py                   #   training loop, model construction, normalization
+├── nerd_eval/                        # Evaluation package
+│   ├── config.py                     #   evaluation configuration dataclass
+│   └── utils.py                      #   dataset loading, alignment, model loading, metrics
+├── tests/                            # Test suite (45 tests)
+│   ├── test_frame_utils.py           #   quaternion and frame transform tests
+│   └── test_preprocessing.py         #   body-frame conversion, targets, contact masking tests
+├── external/neural-robot-dynamics/   # Official NeRD code (cloned, read-only)
+│   ├── models/models.py              #   ModelMixedInput (the NeRD model)
+│   ├── models/model_transformer.py   #   GPT transformer backbone
+│   ├── utils/running_mean_std.py     #   input/output normalization
+│   └── ...
+├── collect_trajectories_with_physx_contacts.py   # Stage 1: collect with per-contact PhysX reports
+├── convert_base_to_nerd_dataset.py               # Stage 2: convert collector → NeRD format
+├── split_nerd_dataset_stratified.py              # Stage 3: stratified train/test split
+├── train_nerd_from_base.py                       # Stage 4: train the NeRD model
+├── collect_eval_solver24.py                      # Stage 5a: collect solver=24 eval trajectories
+├── collect_eval_solver192.py                     # Stage 5b: collect solver=192 eval trajectories
+├── collect_eval_real.py                          # Stage 5: shared eval collection logic
+├── rollout_nerd_eval.py                          # Stage 6: autoregressive NeRD rollout
+├── compare_solver24_vs_nerd.py                   # Stage 7: compute comparison metrics and plots
+├── run_nerd_solver24_vs_192_eval.py              # Orchestrator: runs stages 5–7 end-to-end
+├── verify_contact_impulses.py                    # Utility: verify contact data in collected HDF5
+├── recordings/                       # Raw and converted trajectory datasets
+├── outputs/                          # Training checkpoints and evaluation results
+├── logs/                             # RL-Games policy training logs and checkpoints
+└── checkpoints/                      # Additional policy checkpoints
+```
+
+## Prerequisites
+
+### Conda Environment
+
+```bash
+conda activate peginsert_lab
+```
+
+This environment must have: Isaac Lab 5.1+, Isaac Sim, RL-Games, PyTorch, h5py, numpy, matplotlib.
+
+### External Code
+
+The official NeRD repository must be cloned at:
+```
+external/neural-robot-dynamics/
+```
+
+### Required Policy Checkpoint
+
+An RL-Games trained policy for the peg-insert task. Default location:
+```
+logs/peg_insert_rlgames/2026-03-13_02-25-23/nn/last_peginsert_parallel_1000_ep_800_rew_379.98492.pth
+```
+
+### Paths to Verify
+
+- Policy checkpoint exists at the path above (or override with `--checkpoint`)
+- Isaac Lab Factory assets are cached locally (run Isaac Lab GUI once if needed)
+- `recordings/` and `outputs/` directories exist
+
+---
+
+## End-to-End Command-Line Workflow
+
+### Stage 1: Collect Training Trajectories
+
+Collects solver=192 (default) peg-insert trajectories using the trained RL-Games policy.
+Uses the low-level PhysX contact report API to capture per-contact geometry. **Must run on CPU**
+because PhysX contact reports are not available on GPU for Factory tasks.
+
+**Script:** `collect_trajectories_with_physx_contacts.py`
+
+**Command:**
+```bash
+python collect_trajectories_with_physx_contacts.py \
+  --task Isaac-Factory-PegInsert-Direct-v0 \
+  --num_envs 32 \
+  --num_trajectories 512 \
+  --device cpu \
+  --policy_device cuda:0 \
+  --output_path recordings/physx_cpu_512.hdf5 \
+  --headless
+```
+
+**Inputs:** RL-Games policy checkpoint (auto-discovered or `--checkpoint`).
+
+**Outputs:** `recordings/physx_cpu_512.hdf5` — collector-format HDF5 with shape `[B, T, ...]`.
+
+**Success check:** File exists, prints "Finished writing 512 trajectories", and reports nonzero matching PhysX contacts.
+
+**What is stored per trajectory step:**
+
+| Field | Shape | Source | Description |
+|-------|-------|--------|-------------|
+| `states` | `[47]` | direct+derived | Generalized state (see State Layout below) |
+| `next_states` | `[47]` | direct+derived | Next-step state before auto-reset |
+| `joint_acts` | `[6]` | direct | Action applied to the robot joints |
+| `gravity_dir` | `[3]` | direct | Gravity direction in world frame |
+| `root_body_q` | `[7]` | derived | Peg root pose `[x,y,z,qw,qx,qy,qz]` in local frame |
+| `contact_normals` | `[K,3]` | direct (PhysX) | Contact normals on the source (peg) asset |
+| `contact_points_0` | `[K,3]` | direct (PhysX) | Contact positions from PhysX report |
+| `contact_points_1` | `[K,3]` | derived | Reconstructed as `point0 + normal * depth` |
+| `contact_depths` | `[K]` | derived | `clamp(max(0, -separation), max=0.02)` |
+| `contact_thicknesses` | `[K]` | constant | Always 0.0 (PhysX contact reports don't provide thickness) |
+| `contact_impulses` | `[K]` | direct (PhysX) | Impulse magnitude per contact slot |
+| `contact_impulse_vectors` | `[K,3]` | direct (PhysX) | 3D impulse vector per contact slot |
+| `contact_counts` | scalar | derived | Number of populated contact slots |
+| `dones` | scalar | direct | Episode boundary flag |
+
+Where K=16 (contact slots per environment).
+
+### State Layout (47 dimensions)
+
+| Slice | Name | Width | Source |
+|-------|------|-------|--------|
+| 0–6 | `robot_joint_pos` | 7 | direct |
+| 7–13 | `robot_joint_vel` | 7 | direct |
+| 14–16 | `ee_pos_local` | 3 | derived (world pos - env origin) |
+| 17–20 | `ee_quat_wxyz` | 4 | direct |
+| 21–23 | `ee_lin_vel_w` | 3 | direct |
+| 24–26 | `ee_ang_vel_w` | 3 | direct |
+| 27–29 | `held_root_pos_local` | 3 | derived (peg world pos - env origin) |
+| 30–33 | `held_root_quat_wxyz` | 4 | direct |
+| 34–36 | `held_root_lin_vel_w` | 3 | direct |
+| 37–39 | `held_root_ang_vel_w` | 3 | direct |
+| 40–42 | `fixed_root_pos_local` | 3 | derived (socket world pos - env origin) |
+| 43–46 | `fixed_root_quat_wxyz` | 4 | direct |
+
+### Stage 2: Convert Dataset
+
+Transposes the collector output from `[B, T, ...]` to `[T, B, ...]` format expected by the
+NeRD training infrastructure.
+
+**Script:** `convert_base_to_nerd_dataset.py`
+
+**Command:**
+```bash
+python convert_base_to_nerd_dataset.py \
+  --input recordings/physx_cpu_512.hdf5 \
+  --output recordings/physx_cpu_512_converted.hdf5 \
+  --summary recordings/nerd_base_converted_summary.json
+```
+
+**Inputs:** Collector-format HDF5.
+
+**Outputs:** `recordings/physx_cpu_512_converted.hdf5` with a `/data` group in `[T, B, ...]` layout.
+
+**Success check:** Prints trajectory count and horizon. Summary JSON is written.
+
+### Stage 3: Stratified Split
+
+Creates a difficulty-stratified train/test split based on per-trajectory state-delta MSE.
+
+**Script:** `split_nerd_dataset_stratified.py`
+
+**Command:**
+```bash
+python split_nerd_dataset_stratified.py \
+  --input recordings/physx_cpu_512_converted.hdf5 \
+  --train_indices recordings/train_indices.npy \
+  --test_indices recordings/test_indices.npy \
+  --summary recordings/split_summary.json \
+  --train_ratio 0.8
+```
+
+**Inputs:** Converted HDF5.
+
+**Outputs:** `recordings/train_indices.npy`, `recordings/test_indices.npy`, `recordings/split_summary.json`.
+
+**Success check:** Prints train/test trajectory counts and difficulty statistics.
+
+### Stage 4: Train NeRD
+
+Trains a transformer-based NeRD dynamics model with body-frame preprocessing and
+quaternion-aware targets.
+
+**Script:** `train_nerd_from_base.py`
+
+**Command (fixed pipeline):**
+```bash
+python train_nerd_from_base.py \
+  --dataset recordings/physx_cpu_512_converted.hdf5 \
+  --train_indices recordings/train_indices.npy \
+  --test_indices recordings/test_indices.npy \
+  --output_dir outputs/nerd_fixed_run1 \
+  --device cuda:0 \
+  --history_length 10 \
+  --batch_size 128 \
+  --num_epochs 10 \
+  --learning_rate 1e-4 \
+  --num_workers 4 \
+  --use_body_frame \
+  --use_quat_targets \
+  --use_contact_masking
+```
+
+**Command (baseline/legacy, no preprocessing):**
+```bash
+python train_nerd_from_base.py \
+  --dataset recordings/physx_cpu_512_converted.hdf5 \
+  --train_indices recordings/train_indices.npy \
+  --test_indices recordings/test_indices.npy \
+  --output_dir outputs/nerd_baseline_run1 \
+  --device cuda:0 \
+  --history_length 10 \
+  --batch_size 128 \
+  --num_epochs 10 \
+  --learning_rate 1e-4 \
+  --num_workers 4
+```
+
+**Inputs:** Converted HDF5 + train/test index files.
+
+**Outputs:**
+- `outputs/<run>/best_checkpoint.pt` — best model by eval loss
+- `outputs/<run>/latest_checkpoint.pt` — latest epoch
+- `outputs/<run>/train_config.json` — resolved training config
+- `outputs/<run>/training_metrics.json` — per-epoch metrics
+
+**Preprocessing flags (new in v2):**
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--use_body_frame` | off | Convert states/contacts/gravity to body frame |
+| `--use_quat_targets` | off | Use quaternion delta targets instead of subtraction |
+| `--use_contact_masking` | off | Zero out inactive contact slots |
+
+These flags are saved in the checkpoint and automatically used during rollout.
+
+**Model architecture:**
+- Encoder: MLP (256, 256) for all low-dim inputs concatenated
+- Transformer: 4 layers, 4 heads, 128 embedding dim, causal attention, dropout=0.1
+- Head: MLP (128, 64) → output_dim (47)
+- Input/output normalization via RunningMeanStd
+
+**Default input keys:** `states`, `joint_acts`, `gravity_dir`, `root_body_q`,
+`contact_normals`, `contact_points_0`, `contact_impulses`.
+
+**Training target (with `--use_quat_targets`):**
+- Non-quaternion dims: `next_state - state` (delta)
+- Quaternion dims: `quat_delta(q_from, q_to)` (Hamilton product)
+
+**Training target (without flag):** `next_states - states` (naive subtraction for all dims).
+
+**Loss:** Normalized MSE (prediction and target normalized by output RunningMeanStd).
+
+**Success check:** `best_checkpoint.pt` exists, training loss decreases over epochs.
+
+### Stage 5: Collect Evaluation Trajectories
+
+Collects NEW trajectories for solver=24 (rough) and solver=192 (reference) using the
+existing collector infrastructure. Same policy, same seed, deterministic.
+
+**Scripts:** `collect_eval_solver24.py`, `collect_eval_solver192.py`
+
+**Commands:**
+```bash
+python collect_eval_solver24.py --num_envs 32 --num_trajectories 32 --device cuda:0
+python collect_eval_solver192.py --num_envs 32 --num_trajectories 32 --device cuda:0
+```
+
+**Inputs:** RL-Games policy checkpoint.
+
+**Outputs:**
+- `recordings/eval_solver24_real.hdf5`
+- `recordings/eval_solver192_real.hdf5`
+
+**Note:** These use the standard collector (not PhysX contact report) since evaluation
+only needs states, actions, and root poses — contact data is not consumed during rollout.
+
+**Success check:** Both files exist with matching trajectory counts.
+
+### Stage 6: NeRD Rollout Evaluation
+
+Runs autoregressive NeRD inference starting from solver=24 initial states, using solver=24
+exogenous inputs (actions, contacts, gravity) at each step.
+
+**Script:** `rollout_nerd_eval.py`
+
+**Command:**
+```bash
+python rollout_nerd_eval.py \
+  --solver24_dataset recordings/eval_solver24_real.hdf5 \
+  --solver192_dataset recordings/eval_solver192_real.hdf5 \
+  --checkpoint outputs/nerd_cpu_contact_run1/best_checkpoint.pt \
+  --output_path outputs/nerd_eval_solver24_vs_192/nerd_rollout_from_solver24.hdf5 \
+  --device cuda:0
+```
+
+**Inputs:** Both eval datasets + trained checkpoint.
+
+**Outputs:** `outputs/nerd_eval_solver24_vs_192/nerd_rollout_from_solver24.hdf5`
+
+**How rollout works:**
+1. Load solver24 and solver192 eval datasets, align trajectories by `source_env_ids`
+2. Load the trained NeRD model from checkpoint (including input keys and normalization stats)
+3. Initialize predicted states from solver=24 initial state at t=0
+4. For each step t: build a history window of predicted states + solver24 exogenous inputs,
+   run the model to get `delta = model(inputs)`, compute `next_state = state + delta`
+5. Save the full predicted trajectory
+
+**Success check:** Output HDF5 file exists with `predicted_states` dataset.
+
+### Stage 7: Compare solver=24 vs NeRD
+
+Computes trajectory-level and step-level metrics comparing both solver=24 and NeRD rollouts
+against the solver=192 reference.
+
+**Script:** `compare_solver24_vs_nerd.py`
+
+**Command:**
+```bash
+python compare_solver24_vs_nerd.py \
+  --solver24_dataset recordings/eval_solver24_real.hdf5 \
+  --solver192_dataset recordings/eval_solver192_real.hdf5 \
+  --nerd_rollout outputs/nerd_eval_solver24_vs_192/nerd_rollout_from_solver24.hdf5 \
+  --output_dir outputs/nerd_eval_solver24_vs_192
+```
+
+**Inputs:** Both eval datasets + NeRD rollout HDF5.
+
+**Outputs:**
+- `outputs/nerd_eval_solver24_vs_192/comparison_metrics.json` — all metrics
+- `outputs/nerd_eval_solver24_vs_192/comparison_summary.txt` — human-readable summary
+- `outputs/nerd_eval_solver24_vs_192/comparison_curves.npz` — per-step curves
+- `outputs/nerd_eval_solver24_vs_192/state_mse_over_time.png` — state MSE plot
+- `outputs/nerd_eval_solver24_vs_192/peg_position_error_over_time.png` — peg position plot
+
+**Metrics computed:**
+- State MSE/MAE against solver=192 reference
+- Final-state MSE/MAE
+- Peg position error (Euclidean distance)
+- Peg orientation error (quaternion geodesic distance in degrees)
+- Peg-socket relative position error
+
+**Verdict:** "Does NeRD beat solver=24?" answered by comparing error magnitudes on
+state MSE and state MAE.
+
+**Success check:** `comparison_metrics.json` contains a `verdict` block.
+
+### All-in-One Orchestrator
+
+Runs stages 5–7 sequentially as subprocesses:
+
+```bash
+python run_nerd_solver24_vs_192_eval.py --device cuda:0 --num_envs 32 --num_trajectories 32
+```
+
+### Optional: Verify Contact Data
+
+Post-collection contact quality check:
+
+```bash
+python verify_contact_impulses.py recordings/physx_cpu_512.hdf5
+```
+
+---
+
+## Algorithm Design Details
+
+### Contact Slot Mapping
+
+The simulator produces a variable number of contacts per environment per step. The NeRD model
+requires fixed-width inputs. The collector maps variable-length contacts into K=16 fixed slots:
+
+1. Accumulate raw PhysX contacts across all physics substeps within one env step
+2. For each environment, rank contacts by **impulse magnitude** (primary) with depth as tiebreaker
+3. Fill K slots with the top-K strongest contacts
+4. Zero-fill unused slots (when fewer than K contacts exist)
+
+### NeRD Training Data Construction
+
+1. Collector saves trajectories in `[B, T, ...]` format
+2. Converter transposes to `[T, B, ...]` (NeRD convention)
+3. Stratified split ensures balanced difficulty across train/test
+4. Training dataset serves sliding windows of length `history_length` (default 10)
+5. Each window provides: `{states, next_states, joint_acts, gravity_dir, root_body_q, contact_normals, contact_points_0, contact_impulses}`
+6. Target: `next_states[:, -1, :] - states[:, -1, :]` (last step delta)
+7. All input keys are flattened to `[B, T, D]` and concatenated for the low-dim encoder
+
+### NeRD Rollout Evaluation
+
+The evaluation tests whether the NeRD model produces trajectories closer to solver=192
+than the actual solver=24 simulator does:
+
+1. Both solver=24 and solver=192 collect trajectories with the same policy and seed
+2. Trajectories are aligned by `source_env_ids` for fair comparison
+3. NeRD rollout starts from solver=24 initial state and uses solver=24 exogenous inputs
+4. At each step, NeRD predicts the state delta autoregressively
+5. Metrics compare: `|solver24 - solver192|` vs `|nerd - solver192|`
+6. If NeRD error < solver=24 error, NeRD "beats" the rough baseline
+
+---
+
+## Reproducibility Notes
+
+### Execution Order
+
+Stages must be run in order: 1 → 2 → 3 → 4 → (5a,5b) → 6 → 7.
+
+### File Dependencies
+
+| Stage | Requires | Produces |
+|-------|----------|----------|
+| 1. Collect | Policy checkpoint | `recordings/physx_cpu_512.hdf5` |
+| 2. Convert | Stage 1 output | `recordings/physx_cpu_512_converted.hdf5` |
+| 3. Split | Stage 2 output | `recordings/{train,test}_indices.npy` |
+| 4. Train | Stage 2+3 outputs | `outputs/nerd_cpu_contact_run1/best_checkpoint.pt` |
+| 5. Eval collect | Policy checkpoint | `recordings/eval_solver{24,192}_real.hdf5` |
+| 6. Rollout | Stage 4+5 outputs | NeRD rollout HDF5 |
+| 7. Compare | Stage 5+6 outputs | Metrics JSON, plots, summary |
+
+### Seeds
+
+Default seed=42 is used throughout. Collection, split, and training all respect this seed.

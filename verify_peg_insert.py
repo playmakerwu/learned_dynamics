@@ -1,4 +1,5 @@
 import argparse
+import gc
 
 from isaaclab.app import AppLauncher
 
@@ -69,7 +70,7 @@ def main():
     import torch
 
     import isaaclab_tasks  # noqa: F401
-    from common import build_env_cfg
+    from common import build_env_cfg, ensure_task_assets_available
 
     env = None
     try:
@@ -80,6 +81,7 @@ def main():
             disable_fabric=args.disable_fabric,
             seed=args.seed,
         )
+        ensure_task_assets_available(args.task, env_cfg)
 
         env = gym.make(args.task, cfg=env_cfg)
 
@@ -137,6 +139,8 @@ def main():
     finally:
         if env is not None:
             env.close()
+            env = None
+        gc.collect()
         simulation_app.close()
 
 

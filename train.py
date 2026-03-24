@@ -1,4 +1,5 @@
 import argparse
+import gc
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -41,6 +42,7 @@ def main():
     from common import (
         build_env_cfg,
         configure_rl_games_checkpoint_loading,
+        ensure_task_assets_available,
         latest_checkpoint,
         load_rl_games_cfg,
         mirror_checkpoints,
@@ -61,6 +63,7 @@ def main():
         disable_fabric=args.disable_fabric,
         seed=args.seed,
     )
+    ensure_task_assets_available(args.task, env_cfg)
 
     agent_cfg = load_rl_games_cfg(args.task)
     agent_cfg = patch_rl_games_cfg(
@@ -130,11 +133,17 @@ def main():
             if copied:
                 print(f"Mirrored {len(copied)} checkpoint(s) to: {dst}")
     finally:
+        runner = None
+        env_cfg = None
+        agent_cfg = None
+        gc.collect()
         for env in created_envs:
             try:
                 env.close()
             except Exception:
                 pass
+        created_envs.clear()
+        gc.collect()
         simulation_app.close()
 
 

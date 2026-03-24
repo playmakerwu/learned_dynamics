@@ -1,4 +1,5 @@
 import argparse
+import gc
 import time
 import traceback
 from pathlib import Path
@@ -83,6 +84,7 @@ def main():
         build_env_cfg,
         checkpoint_is_valid,
         configure_rl_games_checkpoint_loading,
+        ensure_task_assets_available,
         list_checkpoints,
         latest_checkpoint,
         load_rl_games_cfg,
@@ -126,6 +128,7 @@ def main():
         disable_fabric=args.disable_fabric,
         seed=args.seed,
     )
+    ensure_task_assets_available(args.task, env_cfg)
 
     agent_cfg = load_rl_games_cfg(args.task)
     agent_cfg = patch_rl_games_cfg(
@@ -154,6 +157,11 @@ def main():
         render_mode="human" if not args.headless else None,
     )
 
+    runner = None
+    player = None
+    render_env = None
+    obses = None
+    checkpoint_data = None
     try:
         if (args.camera_eye is None) != (args.camera_lookat is None):
             raise ValueError("Please provide both --camera_eye and --camera_lookat together.")
@@ -345,11 +353,21 @@ def main():
                 flush=True,
             )
             time.sleep(args.hold_on_exit)
+        player = None
+        runner = None
+        render_env = None
+        obses = None
+        checkpoint_data = None
+        env_cfg = None
+        agent_cfg = None
+        gc.collect()
         for env in created_envs:
             try:
                 env.close()
             except Exception:
                 pass
+        created_envs.clear()
+        gc.collect()
         simulation_app.close()
 
 
