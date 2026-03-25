@@ -42,12 +42,52 @@ def make_parser() -> argparse.ArgumentParser:
         help="Maximum eval batches per epoch. Use 0 to consume the full eval loader.",
     )
     parser.add_argument("--normalization_batches", type=int, default=20)
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="linear",
+        choices=["constant", "linear", "cosine"],
+        help="Learning rate schedule (default: linear, matching official NeRD).",
+    )
+    parser.add_argument(
+        "--lr_end",
+        type=float,
+        default=1e-6,
+        help="End learning rate for linear/cosine schedule (default: 1e-6).",
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay.")
-    parser.add_argument("--transformer_dropout", type=float, default=0.1, help="Transformer dropout rate.")
+    parser.add_argument("--transformer_dropout", type=float, default=0.0, help="Transformer dropout rate.")
     parser.add_argument(
         "--no_normalized_loss",
         action="store_true",
         help="Disable normalized loss (use raw MSE instead).",
+    )
+    parser.add_argument(
+        "--use_body_frame",
+        action="store_true",
+        help="Convert states/contacts/gravity to body frame anchored at root_body_q.",
+    )
+    parser.add_argument(
+        "--use_quat_targets",
+        action="store_true",
+        help="Use quaternion delta targets instead of naive subtraction for orientation dims.",
+    )
+    parser.add_argument(
+        "--use_contact_masking",
+        action="store_true",
+        help="Zero out inactive contact slots (beyond contact_counts) before training.",
+    )
+    parser.add_argument(
+        "--num_contact_slots",
+        type=int,
+        default=16,
+        help="Number of fixed contact slots per environment (default: 16).",
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm (default: 1.0, set 0 to disable).",
     )
     return parser
 
@@ -74,6 +114,13 @@ def main() -> None:
         weight_decay=args.weight_decay,
         transformer_dropout=args.transformer_dropout,
         normalized_loss=not args.no_normalized_loss,
+        use_body_frame=args.use_body_frame,
+        use_quat_targets=args.use_quat_targets,
+        use_contact_masking=args.use_contact_masking,
+        num_contact_slots=args.num_contact_slots,
+        grad_clip_norm=args.grad_clip_norm,
+        lr_schedule=args.lr_schedule,
+        lr_end=args.lr_end,
     )
     summary = run_training(config)
 

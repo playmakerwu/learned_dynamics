@@ -97,19 +97,26 @@ class TrainConfig:
     weight_decay: float = 1e-4
     normalized_loss: bool = True
 
-    # Body-frame and preprocessing options (new, default=on for NeRD correctness).
-    use_body_frame: bool = True
-    use_quat_targets: bool = True
-    use_contact_masking: bool = True
+    # LR schedule (matches official NeRD).
+    lr_schedule: str = "linear"  # "constant", "linear", or "cosine"
+    lr_end: float = 1e-6
+
+    # Body-frame and preprocessing options.
+    # Default to False for backward compatibility with CLI; pass --use_body_frame
+    # etc. to enable.  When constructing TrainConfig directly in code, set these
+    # to True for the corrected NeRD pipeline.
+    use_body_frame: bool = False
+    use_quat_targets: bool = False
+    use_contact_masking: bool = False
     num_contact_slots: int = 16
 
-    # Official NeRD model hyperparameters, adapted for the peg-insert dataset.
+    # NeRD model hyperparameters for Franka-class manipulators.
     encoder_layer_sizes: tuple[int, ...] = (256, 256)
-    transformer_layers: int = 4
-    transformer_heads: int = 4
-    transformer_embedding_dim: int = 128
-    transformer_dropout: float = 0.1
-    model_head_layer_sizes: tuple[int, ...] = (128, 64)
+    transformer_layers: int = 6
+    transformer_heads: int = 12
+    transformer_embedding_dim: int = 384
+    transformer_dropout: float = 0.0
+    model_head_layer_sizes: tuple[int, ...] = (64,)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -230,6 +237,25 @@ def set_random_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def get_scheduled_lr(config: TrainConfig, epoch: int, total_epochs: int) -> float:
+    """Compute the learning rate for a given epoch using the configured schedule.
+
+    Matches the official NeRD trainer: linear or cosine decay from
+    ``learning_rate`` to ``lr_end`` over training.
+    """
+    if total_epochs <= 1:
+        return config.learning_rate
+    ratio = epoch / total_epochs
+    if config.lr_schedule == "constant":
+        return config.learning_rate
+    if config.lr_schedule == "linear":
+        return config.learning_rate * (1.0 - ratio) + config.lr_end * ratio
+    if config.lr_schedule == "cosine":
+        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+        return config.lr_end + coeff * (config.learning_rate - config.lr_end)
+    raise ValueError(f"Unknown lr_schedule: {config.lr_schedule!r}")
 
 
 def move_batch_to_device(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.Tensor]:
@@ -625,7 +651,13 @@ def run_training(config: TrainConfig) -> dict[str, Any]:
     latest_checkpoint_path = config.output_dir / "latest_checkpoint.pt"
     best_checkpoint_path = config.output_dir / "best_checkpoint.pt"
 
+    total_epochs = config.num_epochs
     for epoch in range(start_epoch, start_epoch + config.num_epochs):
+        # Update learning rate per the schedule (matches official NeRD).
+        lr = get_scheduled_lr(config, epoch - start_epoch, total_epochs)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
         train_metrics = train_or_eval_epoch(
             model,
             train_loader,
@@ -675,9 +707,11 @@ def run_training(config: TrainConfig) -> dict[str, Any]:
             state_layout_list=state_layout_list,
         )
 
+        result["lr"] = lr
         history.append(result)
         print(
             f"epoch={epoch:03d} "
+            f"lr={lr:.2e} "
             f"train_loss={train_metrics['loss']:.6f} "
             f"train_raw_mse={train_metrics['raw_loss']:.6f}",
             flush=True,
