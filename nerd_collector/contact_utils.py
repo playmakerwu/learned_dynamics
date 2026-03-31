@@ -19,6 +19,7 @@ class FixedSlotContacts:
     contact_counts: torch.Tensor
     contact_impulses: torch.Tensor  # [num_envs, K] impulse magnitude per slot
     contact_impulse_vectors: torch.Tensor  # [num_envs, K, 3] impulse direction per slot
+    contact_identities: torch.Tensor  # [num_envs, K] int32: 0=hole/env, 1=robot
 
 
 def safe_normalize(vectors: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
@@ -49,6 +50,7 @@ def empty_fixed_slot_contacts(
         contact_counts=torch.zeros((num_envs,), device=device, dtype=torch.int32),
         contact_impulses=torch.zeros((num_envs, k), device=device, dtype=dtype),
         contact_impulse_vectors=torch.zeros((num_envs, k, 3), device=device, dtype=dtype),
+        contact_identities=torch.zeros((num_envs, k), device=device, dtype=torch.int32),
     )
 
 

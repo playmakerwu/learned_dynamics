@@ -167,9 +167,15 @@ class PhysXContactReportExtractor:
         self.target_local_root = self.target_root.replace("/World/envs/env_0", "")
         self.sim_interface = get_physx_simulation_interface()
 
+        # Robot asset for peg-centric contact identity classification.
+        self.robot_asset = env.scene.articulations[cfg.robot_asset_name]
+        self.robot_root = self.robot_asset.cfg.prim_path.replace(".*", "0")
+        self.robot_local_root = self.robot_root.replace("/World/envs/env_0", "")
+
         carb.settings.get_settings().set_bool("/physics/disableContactProcessing", False)
         self.enabled_source_contact_report_prims = ensure_contact_report_api(self.source_root, threshold=0.0)
         self.enabled_target_contact_report_prims = ensure_contact_report_api(self.target_root, threshold=0.0)
+        self.enabled_robot_contact_report_prims = ensure_contact_report_api(self.robot_root, threshold=0.0)
 
         self._records_per_env: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
         self.total_matching_contacts_seen = 0
@@ -204,6 +210,7 @@ class PhysXContactReportExtractor:
             collider0 = str(PhysicsSchemaTools.intToSdfPath(header.collider0))
             collider1 = str(PhysicsSchemaTools.intToSdfPath(header.collider1))
 
+            # Try peg ↔ hole (identity=0), then peg ↔ robot (identity=1).
             match = _match_source_target_pair(
                 actor0=actor0,
                 actor1=actor1,
@@ -212,6 +219,17 @@ class PhysXContactReportExtractor:
                 source_local_root=self.source_local_root,
                 target_local_root=self.target_local_root,
             )
+            contact_identity = 0  # hole/environment
+            if match is None:
+                match = _match_source_target_pair(
+                    actor0=actor0,
+                    actor1=actor1,
+                    collider0=collider0,
+                    collider1=collider1,
+                    source_local_root=self.source_local_root,
+                    target_local_root=self.robot_local_root,
+                )
+                contact_identity = 1  # robot
             if match is None:
                 continue
 
@@ -241,6 +259,7 @@ class PhysXContactReportExtractor:
                         "impulse_norm": torch.linalg.norm(raw_impulse),
                         "impulse_vector": raw_impulse,
                         "separation": raw_separation,
+                        "identity": contact_identity,  # 0=hole/env, 1=robot
                     }
                 )
 
@@ -275,6 +294,9 @@ class PhysXContactReportExtractor:
             separations = torch.tensor(
                 [record["separation"] for record in env_records], device=self.device, dtype=self.dtype
             )
+            identities = torch.tensor(
+                [record["identity"] for record in env_records], device=self.device, dtype=torch.int32
+            )
 
             # Derived quantities for NeRD representation.
             depths = torch.clamp(-separations, min=0.0, max=self.cfg.max_depth_clamp)
@@ -296,6 +318,7 @@ class PhysXContactReportExtractor:
             slots.contact_points_1[env_id, :slot_count] = points_1.index_select(0, chosen)
             slots.contact_impulses[env_id, :slot_count] = impulse_norms.index_select(0, chosen)
             slots.contact_impulse_vectors[env_id, :slot_count] = impulse_vectors.index_select(0, chosen)
+            slots.contact_identities[env_id, :slot_count] = identities.index_select(0, chosen)
 
             active_envs += 1
             total_slot_contacts += slot_count

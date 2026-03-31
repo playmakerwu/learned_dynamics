@@ -13,12 +13,10 @@ trajectory datasets with simulator-level state and contact features.
 from __future__ import annotations
 
 import argparse
-import gc
 import sys
-import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from isaaclab.app import AppLauncher
 
@@ -27,11 +25,11 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
     from nerd_collector.config import CONFIG, CollectorConfig
-    from nerd_collector.contact_utils import FixedSlotContacts, assign_contact_slots, empty_fixed_slot_contacts
+    from nerd_collector.contact_utils import FixedSlotContacts
     from nerd_collector.hdf5_utils import TrajectoryHDF5Writer
 else:
     from .config import CONFIG, CollectorConfig
-    from .contact_utils import FixedSlotContacts, assign_contact_slots, empty_fixed_slot_contacts
+    from .contact_utils import FixedSlotContacts
     from .hdf5_utils import TrajectoryHDF5Writer
 
 
@@ -289,118 +287,6 @@ class StateAssembler:
         return layout
 
 
-class PhysXContactExtractor:
-    """Read raw PhysX contacts and map them into fixed K contact slots per env."""
-
-    def __init__(self, env: Any, cfg: CollectorConfig):
-        self.env = env
-        self.cfg = cfg
-        self.source_asset = env.scene.articulations[cfg.contact_source_asset_name]
-        self.target_asset = env.scene.articulations[cfg.contact_target_asset_name]
-        self.available = False
-        self._warned_runtime = False
-        self.initialization_error: Exception | None = None
-
-        if not cfg.enable_raw_contact_extraction:
-            self.initialization_error = RuntimeError(
-                "Raw contact extraction is disabled by config; contact tensors will be zero-filled."
-            )
-            return
-
-        if (
-            str(env.device).startswith("cuda")
-            and cfg.task_name.startswith("Isaac-Factory-")
-            and cfg.contact_target_asset_name == "fixed_asset"
-            and not cfg.allow_unsupported_gpu_contact_filter
-        ):
-            self.initialization_error = RuntimeError(
-                "Skipping raw filtered PhysX contact extraction on GPU for the Factory FixedAsset collider. "
-                "This task emits the native warning "
-                "'GPU contact filter for collider ... is not supported' and may terminate before writing data. "
-                "The collector will keep the contact slot tensors zero-filled instead. "
-                "If you need raw contact slots, try simulating on CPU with policy on GPU."
-            )
-            return
-
-        try:
-            import carb
-            from isaacsim.core.simulation_manager import SimulationManager
-
-            carb.settings.get_settings().set_bool("/physics/disableContactProcessing", False)
-            physics_sim_view = SimulationManager.get_physics_sim_view()
-            source_glob = _articulation_contact_glob(self.source_asset)
-            target_glob = _articulation_contact_glob(self.target_asset)
-            self.contact_view = physics_sim_view.create_rigid_contact_view(
-                source_glob,
-                filter_patterns=[target_glob],
-                max_contact_data_count=(
-                    self.cfg.max_contact_data_count_per_prim * max(1, len(self.source_asset.body_names)) * env.num_envs
-                ),
-            )
-            if getattr(self.contact_view, "_backend", None) is None:
-                raise RuntimeError("PhysX failed to create the rigid contact view backend.")
-
-            self.num_source_bodies = len(self.source_asset.body_names)
-            self.num_filter_bodies = int(self.contact_view.filter_count)
-            self.available = True
-        except Exception as exc:
-            self.initialization_error = exc
-            if self.cfg.strict_contact_extraction:
-                raise
-
-    def capture(self) -> FixedSlotContacts:
-        """Capture current raw contacts and project them into fixed K slots."""
-
-        if not self.available:
-            return empty_fixed_slot_contacts(
-                num_envs=self.env.num_envs,
-                k=self.cfg.contact_slot_count_k,
-                device=self.env.device,
-                dtype=self.source_asset.data.root_link_pose_w.dtype,
-                contact_thickness=self.cfg.contact_thickness,
-            )
-
-        try:
-            force_buffer, point_buffer, normal_buffer, separation_buffer, count_buffer, start_buffer = (
-                self.contact_view.get_contact_data(dt=self.env.physics_dt)
-            )
-            return assign_contact_slots(
-                force_magnitudes=force_buffer,
-                contact_points_0=point_buffer,
-                contact_normals=normal_buffer,
-                separations=separation_buffer,
-                buffer_count=count_buffer,
-                buffer_start_indices=start_buffer,
-                num_envs=self.env.num_envs,
-                num_source_bodies=self.num_source_bodies,
-                num_filter_bodies=max(1, self.num_filter_bodies),
-                k=self.cfg.contact_slot_count_k,
-                max_depth=self.cfg.max_depth_clamp,
-                contact_thickness=self.cfg.contact_thickness,
-            )
-        except Exception:
-            if self.cfg.strict_contact_extraction:
-                raise
-            if not self._warned_runtime:
-                print("Warning: raw PhysX contact extraction failed; contact tensors will be zero-filled.", flush=True)
-                traceback.print_exc()
-                self._warned_runtime = True
-            return empty_fixed_slot_contacts(
-                num_envs=self.env.num_envs,
-                k=self.cfg.contact_slot_count_k,
-                device=self.env.device,
-                dtype=self.source_asset.data.root_link_pose_w.dtype,
-                contact_thickness=self.cfg.contact_thickness,
-            )
-
-
-def _articulation_contact_glob(articulation: Any) -> str:
-    if not articulation.body_names:
-        raise RuntimeError(f"Articulation at '{articulation.cfg.prim_path}' has no bodies to build a contact view from.")
-    body_names_regex = r"(" + "|".join(articulation.body_names) + r")"
-    return f"{articulation.cfg.prim_path}/{body_names_regex}".replace(".*", "*")
-
-
 @dataclass(slots=True)
 class StepResult:
     next_obs: Any
@@ -410,6 +296,7 @@ class StepResult:
     truncated: Any
     extras: dict[str, Any]
     next_snapshot: StateSnapshot
+    applied_joint_torque: Any | None = None  # [N, num_joints] from last substep
 
 
 class EpisodeStorage:
@@ -421,7 +308,7 @@ class EpisodeStorage:
         num_envs: int,
         horizon: int,
         state_dim: int,
-        action_dim: int,
+        torque_dim: int,
         contact_slots: int,
         storage_device: str,
         save_root_body_q: bool,
@@ -429,6 +316,7 @@ class EpisodeStorage:
         save_contact_points_1: bool,
         save_contact_impulses: bool = True,
         save_contact_impulse_vectors: bool = True,
+        save_contact_identities: bool = True,
     ) -> None:
         import torch
 
@@ -442,7 +330,7 @@ class EpisodeStorage:
         self.buffers: dict[str, Any] = {
             "states": torch.zeros((num_envs, horizon, state_dim), device=storage_device, dtype=torch.float32),
             "next_states": torch.zeros((num_envs, horizon, state_dim), device=storage_device, dtype=torch.float32),
-            "joint_acts": torch.zeros((num_envs, horizon, action_dim), device=storage_device, dtype=torch.float32),
+            "applied_joint_torque": torch.zeros((num_envs, horizon, torque_dim), device=storage_device, dtype=torch.float32),
             "gravity_dir": torch.zeros((num_envs, horizon, 3), device=storage_device, dtype=torch.float32),
             "contact_normals": torch.zeros(
                 (num_envs, horizon, contact_slots, 3), device=storage_device, dtype=torch.float32
@@ -481,6 +369,12 @@ class EpisodeStorage:
                 (num_envs, horizon, contact_slots, 3),
                 device=storage_device,
                 dtype=torch.float32,
+            )
+        if save_contact_identities:
+            self.buffers["contact_identities"] = torch.zeros(
+                (num_envs, horizon, contact_slots),
+                device=storage_device,
+                dtype=torch.int32,
             )
 
     def append(
@@ -660,81 +554,11 @@ def load_player(cfg: CollectorConfig, checkpoint: Path) -> tuple[Any, Any]:
     return runner, player
 
 
-def step_direct_env_for_collection(
-    *,
-    direct_env: Any,
-    wrapped_env: Any,
-    action: Any,
-    snapshot_fn: Callable[[], StateSnapshot],
-    obs_to_torch_fn: Callable[[Any], Any],
-) -> StepResult:
-    """Step a DirectRLEnv while capturing terminal next_states before auto-reset."""
-
-    action = action.to(direct_env.device)
-    direct_env._pre_physics_step(action)
-    is_rendering = direct_env.sim.has_gui() or direct_env.sim.has_rtx_sensors()
-
-    for _ in range(direct_env.cfg.decimation):
-        direct_env._sim_step_counter += 1
-        direct_env._apply_action()
-        direct_env.scene.write_data_to_sim()
-        direct_env.sim.step(render=False)
-        if direct_env._sim_step_counter % direct_env.cfg.sim.render_interval == 0 and is_rendering:
-            direct_env.sim.render()
-        direct_env.scene.update(dt=direct_env.physics_dt)
-
-    direct_env.episode_length_buf += 1
-    direct_env.common_step_counter += 1
-    direct_env.reset_terminated[:], direct_env.reset_time_outs[:] = direct_env._get_dones()
-    direct_env.reset_buf = direct_env.reset_terminated | direct_env.reset_time_outs
-    direct_env.reward_buf = direct_env._get_rewards()
-
-    # Snapshot before reset so terminal transitions see the actual terminal state.
-    next_snapshot = snapshot_fn()
-
-    reset_env_ids = direct_env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-    if len(reset_env_ids) > 0:
-        direct_env._reset_idx(reset_env_ids)
-        if direct_env.sim.has_rtx_sensors() and direct_env.cfg.num_rerenders_on_reset > 0:
-            for _ in range(direct_env.cfg.num_rerenders_on_reset):
-                direct_env.sim.render()
-
-    if direct_env.cfg.events and "interval" in direct_env.event_manager.available_modes:
-        direct_env.event_manager.apply(mode="interval", dt=direct_env.step_dt)
-
-    direct_env.obs_buf = direct_env._get_observations()
-    if direct_env.cfg.observation_noise_model:
-        direct_env.obs_buf["policy"] = direct_env._observation_noise_model(direct_env.obs_buf["policy"])
-
-    # Match RL-Games' BasePlayer.env_step(): convert wrapper output back into the
-    # tensor format expected by player.get_action().
-    next_obs = obs_to_torch_fn(wrapped_env._process_obs(direct_env.obs_buf))
-    rewards = direct_env.reward_buf.to(device=wrapped_env._rl_device)
-    terminated = direct_env.reset_terminated.to(device=wrapped_env._rl_device)
-    truncated = direct_env.reset_time_outs.to(device=wrapped_env._rl_device)
-    dones = (direct_env.reset_terminated | direct_env.reset_time_outs).to(device=wrapped_env._rl_device)
-    extras = {
-        key: value.to(device=wrapped_env._rl_device, non_blocking=True) if hasattr(value, "to") else value
-        for key, value in direct_env.extras.items()
-    }
-    if "log" in extras:
-        extras["episode"] = extras.pop("log")
-    return StepResult(
-        next_obs=next_obs,
-        rewards=rewards,
-        dones=dones,
-        terminated=terminated,
-        truncated=truncated,
-        extras=extras,
-        next_snapshot=next_snapshot,
-    )
-
-
 def build_transition_batch(
     *,
     current_snapshot: StateSnapshot,
     next_snapshot: StateSnapshot,
-    actions: Any,
+    applied_joint_torque: Any,
     contacts: FixedSlotContacts,
     dones: Any,
     terminated: Any,
@@ -746,7 +570,7 @@ def build_transition_batch(
     transition = {
         "states": current_snapshot.state,  # [N, state_dim] current simulator state for NeRD.
         "next_states": next_snapshot.state,  # [N, state_dim] next simulator state before any auto-reset.
-        "joint_acts": actions,  # [N, act_dim] action actually applied to Isaac Lab.
+        "applied_joint_torque": applied_joint_torque,  # [N, torque_dim] actual joint torque sent to PhysX.
         "gravity_dir": current_snapshot.gravity_dir,  # [N, 3] gravity direction in world frame.
         "contact_normals": contacts.contact_normals,  # [N, K, 3] normalized contact normals.
         "contact_depths": contacts.contact_depths,  # [N, K] clamped penetration depths.
@@ -766,6 +590,8 @@ def build_transition_batch(
         transition["contact_impulses"] = contacts.contact_impulses  # [N, K] impulse magnitude per slot.
     if cfg.save_contact_impulse_vectors:
         transition["contact_impulse_vectors"] = contacts.contact_impulse_vectors  # [N, K, 3] impulse vector per slot.
+    if cfg.save_contact_identities:
+        transition["contact_identities"] = contacts.contact_identities  # [N, K] int32: 0=hole/env, 1=robot.
     return transition
 
 
@@ -774,7 +600,7 @@ def build_writer(
     cfg: CollectorConfig,
     horizon: int,
     state_dim: int,
-    action_dim: int,
+    torque_dim: int,
     state_layout: list[dict[str, Any]],
     step_dt: float,
 ) -> TrajectoryHDF5Writer:
@@ -785,7 +611,7 @@ def build_writer(
     field_specs: dict[str, tuple[tuple[int, ...], np.dtype | str]] = {
         "states": ((state_dim,), np.float32),
         "next_states": ((state_dim,), np.float32),
-        "joint_acts": ((action_dim,), np.float32),
+        "applied_joint_torque": ((torque_dim,), np.float32),
         "gravity_dir": ((3,), np.float32),
         "contact_normals": ((cfg.contact_slot_count_k, 3), np.float32),
         "contact_depths": ((cfg.contact_slot_count_k,), np.float32),
@@ -805,13 +631,15 @@ def build_writer(
         field_specs["contact_impulses"] = ((cfg.contact_slot_count_k,), np.float32)
     if cfg.save_contact_impulse_vectors:
         field_specs["contact_impulse_vectors"] = ((cfg.contact_slot_count_k, 3), np.float32)
+    if cfg.save_contact_identities:
+        field_specs["contact_identities"] = ((cfg.contact_slot_count_k,), np.int32)
 
     metadata = cfg.to_metadata_dict()
     metadata.update(
         {
             "task_name": cfg.task_name,
             "state_dim": state_dim,
-            "act_dim": action_dim,
+            "torque_dim": torque_dim,
             "num_contacts_per_env": cfg.contact_slot_count_k,
             "collection_horizon": horizon,
             "step_dt": float(step_dt),
@@ -828,198 +656,3 @@ def build_writer(
     )
 
 
-def main() -> None:
-    parser = make_parser()
-    argv = sys.argv[1:]
-    args = parser.parse_args(argv)
-    cfg = resolve_runtime_config(CONFIG, args, argv)
-    validate_collection_config(cfg)
-
-    app_launcher = AppLauncher(args)
-    simulation_app = app_launcher.app
-
-    created_envs: list[Any] = []
-    runner = None
-    player = None
-    writer = None
-
-    try:
-        import isaaclab_tasks  # noqa: F401
-        import torch
-        from isaaclab.envs import DirectRLEnv
-
-        from common import ensure_task_assets_available, register_rl_games_env
-
-        checkpoint = resolve_checkpoint_path(cfg)
-        env_cfg = build_env_cfg(cfg)
-        ensure_task_assets_available(cfg.task_name, env_cfg)
-
-        created_envs = register_rl_games_env(
-            cfg.task_name,
-            env_cfg,
-            rl_device=cfg.resolved_policy_device(),
-            clip_obs=cfg.clip_obs,
-            clip_actions=cfg.clip_actions,
-            render_mode="human" if not cfg.headless else None,
-        )
-
-        runner, player = load_player(cfg, checkpoint)
-        wrapped_env = getattr(player.env, "env", created_envs[0] if created_envs else None)
-        if wrapped_env is None:
-            raise RuntimeError("Unable to recover the RL-Games wrapped environment from the player.")
-        direct_env = wrapped_env.unwrapped
-
-        obses = player.env_reset(player.env)
-        batch_size = player.get_batch_size(obses, batch_size=1)
-        print(f"Detected policy batch size: {batch_size}", flush=True)
-        if player.is_rnn:
-            player.init_rnn()
-
-        assembler = StateAssembler(direct_env, cfg)
-        contact_extractor = PhysXContactExtractor(direct_env, cfg)
-        if not contact_extractor.available and contact_extractor.initialization_error is not None:
-            print(
-                "Warning: raw PhysX contact view could not be initialized; contact tensors will be zero-filled.\n"
-                f"Reason: {contact_extractor.initialization_error}",
-                flush=True,
-            )
-
-        horizon = resolve_horizon(cfg, direct_env)
-        action_dim = int(wrapped_env.action_space.shape[0])
-        storage_device = direct_env.device if (cfg.save_on_gpu_first and "cuda" in str(direct_env.device)) else "cpu"
-        writer = build_writer(
-            cfg=cfg,
-            horizon=horizon,
-            state_dim=assembler.state_dim,
-            action_dim=action_dim,
-            state_layout=assembler.layout_metadata,
-            step_dt=float(direct_env.step_dt),
-        )
-        print("HDF5 writer initialized.", flush=True)
-        episode_storage = EpisodeStorage(
-            num_envs=direct_env.num_envs,
-            horizon=horizon,
-            state_dim=assembler.state_dim,
-            action_dim=action_dim,
-            contact_slots=cfg.contact_slot_count_k,
-            storage_device=storage_device,
-            save_root_body_q=cfg.save_root_body_q,
-            save_contact_points_0=cfg.save_contact_points_0,
-            save_contact_points_1=cfg.save_contact_points_1,
-            save_contact_impulses=cfg.save_contact_impulses,
-            save_contact_impulse_vectors=cfg.save_contact_impulse_vectors,
-        )
-
-        total_env_steps = 0
-        trajectories_written = 0
-        print(f"Task: {cfg.task_name}", flush=True)
-        print(f"Checkpoint: {checkpoint}", flush=True)
-        print(f"Num envs: {cfg.num_envs}", flush=True)
-        print(f"Simulation device: {cfg.device}", flush=True)
-        print(f"Policy device: {cfg.resolved_policy_device()}", flush=True)
-        print(f"Output path: {cfg.resolved_output_path()}", flush=True)
-        print(f"Horizon: {horizon}", flush=True)
-        print(f"Contact slots K: {cfg.contact_slot_count_k}", flush=True)
-
-        with torch.inference_mode():
-            while writer.remaining_capacity > 0:
-                current_snapshot = assembler.capture()
-                contacts = contact_extractor.capture()
-
-                policy_action = player.get_action(obses, is_deterministic=cfg.deterministic_policy)
-                applied_action = policy_action.detach()
-                if cfg.action_noise_std > 0.0:
-                    applied_action = applied_action + cfg.action_noise_std * torch.randn_like(applied_action)
-                applied_action = torch.clamp(applied_action, -cfg.clip_actions, cfg.clip_actions)
-
-                if cfg.use_manual_direct_step and isinstance(direct_env, DirectRLEnv):
-                    step_result = step_direct_env_for_collection(
-                        direct_env=direct_env,
-                        wrapped_env=wrapped_env,
-                        action=applied_action,
-                        snapshot_fn=assembler.capture,
-                        obs_to_torch_fn=player.obs_to_torch,
-                    )
-                else:
-                    next_obs, rewards, dones, extras = player.env_step(player.env, applied_action)
-                    next_snapshot = assembler.capture()
-                    terminated = direct_env.reset_terminated.to(device=wrapped_env._rl_device)
-                    truncated = direct_env.reset_time_outs.to(device=wrapped_env._rl_device)
-                    step_result = StepResult(
-                        next_obs=next_obs,
-                        rewards=rewards,
-                        dones=dones,
-                        terminated=terminated,
-                        truncated=truncated,
-                        extras=extras,
-                        next_snapshot=next_snapshot,
-                    )
-
-                transition = build_transition_batch(
-                    current_snapshot=current_snapshot,
-                    next_snapshot=step_result.next_snapshot,
-                    actions=applied_action,
-                    contacts=contacts,
-                    dones=step_result.dones,
-                    terminated=step_result.terminated,
-                    truncated=step_result.truncated,
-                    cfg=cfg,
-                )
-                episode_storage.append(transition=transition, rewards=step_result.rewards)
-
-                if player.is_rnn and player.states is not None:
-                    done_indices = step_result.dones.nonzero(as_tuple=False).squeeze(-1)
-                    for state in player.states:
-                        state[:, done_indices, :] = 0.0
-
-                completed = episode_storage.finalize_done(step_result.dones)
-                for env_id, length, episode_return, trajectory in completed:
-                    if writer.remaining_capacity <= 0:
-                        break
-                    writer.append_trajectory(
-                        trajectory,
-                        length=length,
-                        env_id=env_id,
-                        episode_return=episode_return,
-                    )
-                    trajectories_written += 1
-                    print(
-                        f"trajectory={trajectories_written:04d} | env={env_id} | steps={length} | return={episode_return:.3f}",
-                        flush=True,
-                    )
-
-                obses = step_result.next_obs
-                total_env_steps += 1
-                if cfg.log_every_steps > 0 and total_env_steps % cfg.log_every_steps == 0:
-                    print(
-                        f"env_step={total_env_steps:06d} | "
-                        f"trajectories_written={writer.num_written}/{cfg.num_trajectories_to_save}",
-                        flush=True,
-                    )
-
-        print(
-            f"Finished writing {writer.num_written} trajectories and {writer.total_transitions} transitions.",
-            flush=True,
-        )
-    except BaseException:
-        print("Collector failed with the following exception:", flush=True)
-        traceback.print_exc()
-        raise
-    finally:
-        if writer is not None:
-            writer.close()
-        player = None
-        runner = None
-        gc.collect()
-        for env in created_envs:
-            try:
-                env.close()
-            except Exception:
-                pass
-        created_envs.clear()
-        gc.collect()
-        simulation_app.close()
-
-
-if __name__ == "__main__":
-    main()

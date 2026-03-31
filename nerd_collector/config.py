@@ -63,16 +63,11 @@ class CollectorConfig:
     deterministic_policy: bool = True
     action_noise_std: float = 0.0
     log_every_steps: int = 100
-    use_manual_direct_step: bool = True
 
     # Contact processing.
-    contact_slot_count_k: int = 16
+    contact_slot_count_k: int = 64
     max_depth_clamp: float = 0.02
     contact_thickness: float = 0.0
-    max_contact_data_count_per_prim: int = 64
-    strict_contact_extraction: bool = False
-    enable_raw_contact_extraction: bool = True
-    allow_unsupported_gpu_contact_filter: bool = False
 
     # Which simulator assets to read.
     robot_asset_name: str = "robot"
@@ -88,6 +83,7 @@ class CollectorConfig:
     save_contact_points_1: bool = True
     save_contact_impulses: bool = True
     save_contact_impulse_vectors: bool = True
+    save_contact_identities: bool = True
 
     # HDF5 writing.
     hdf5: HDF5Config = field(default_factory=HDF5Config)

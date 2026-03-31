@@ -28,6 +28,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+ERROR_HORIZONS = [1, 5, 10, 20, 50, 100, 150]
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare solver24 and NeRD rollouts against the solver192 reference.")
@@ -80,6 +82,68 @@ def save_plot(path: Path, *, title: str, ylabel: str, baseline_curve: np.ndarray
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
+
+
+def compute_error_vs_horizon(
+    gt_states: np.ndarray,
+    solver24_states: np.ndarray,
+    nerd_states: np.ndarray,
+    horizons: list[int],
+) -> tuple[list[float], list[float]]:
+    """Compute rollout-horizon MAE against the solver192 ground truth."""
+
+    if gt_states.shape != solver24_states.shape or gt_states.shape != nerd_states.shape:
+        raise ValueError(
+            "Expected gt_states, solver24_states, and nerd_states to share the same shape, "
+            f"got {gt_states.shape}, {solver24_states.shape}, and {nerd_states.shape}."
+        )
+    if gt_states.ndim != 3:
+        raise ValueError(f"Expected [B, T, D] state arrays, got shape {gt_states.shape}.")
+
+    solver24_errors: list[float] = []
+    nerd_errors: list[float] = []
+    max_horizon = gt_states.shape[1]
+
+    for horizon in horizons:
+        if horizon < 0:
+            raise ValueError(f"Horizons must be non-negative, got {horizon}.")
+        if horizon >= max_horizon:
+            solver24_errors.append(float("nan"))
+            nerd_errors.append(float("nan"))
+            continue
+
+        gt_step = gt_states[:, horizon, :]
+        solver24_step = solver24_states[:, horizon, :]
+        nerd_step = nerd_states[:, horizon, :]
+
+        solver24_valid = np.all(np.isfinite(gt_step), axis=-1) & np.all(np.isfinite(solver24_step), axis=-1)
+        nerd_valid = np.all(np.isfinite(gt_step), axis=-1) & np.all(np.isfinite(nerd_step), axis=-1)
+
+        if np.any(solver24_valid):
+            solver24_errors.append(float(np.mean(np.abs(solver24_step[solver24_valid] - gt_step[solver24_valid]))))
+        else:
+            solver24_errors.append(float("nan"))
+
+        if np.any(nerd_valid):
+            nerd_errors.append(float(np.mean(np.abs(nerd_step[nerd_valid] - gt_step[nerd_valid]))))
+        else:
+            nerd_errors.append(float("nan"))
+
+    return solver24_errors, nerd_errors
+
+
+def plot_error_vs_horizon(horizons: list[int], solver24_errors: list[float], nerd_errors: list[float]) -> None:
+    """Plot state MAE against prediction horizon for solver24 and NeRD."""
+
+    plt.figure(figsize=(8, 4.5))
+    plt.plot(horizons, solver24_errors, marker="o", label="solver=24", linewidth=2.0)
+    plt.plot(horizons, nerd_errors, marker="o", label="NeRD", linewidth=2.0)
+    plt.xlabel("Prediction Horizon (steps)")
+    plt.ylabel("Mean Absolute Error")
+    plt.title("Error vs Horizon: solver24 vs NeRD")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
 
 
 def main() -> None:
@@ -135,6 +199,20 @@ def main() -> None:
     nerd_rel = predicted_states[..., held_pos_slice] - predicted_fixed_root_q[..., :3]
     solver24_rel_err = np.linalg.norm(solver24_rel - solver192_rel, axis=-1)
     nerd_rel_err = np.linalg.norm(nerd_rel - solver192_rel, axis=-1)
+
+    gt_states_for_horizon = solver192.data["states"].astype(np.float32, copy=True)
+    solver24_states_for_horizon = solver24.data["states"].astype(np.float32, copy=True)
+    nerd_states_for_horizon = predicted_states.astype(np.float32, copy=True)
+    gt_states_for_horizon[~valid_mask] = np.nan
+    solver24_states_for_horizon[~valid_mask] = np.nan
+    nerd_states_for_horizon[~valid_mask] = np.nan
+
+    solver24_horizon_errors, nerd_horizon_errors = compute_error_vs_horizon(
+        gt_states_for_horizon,
+        solver24_states_for_horizon,
+        nerd_states_for_horizon,
+        ERROR_HORIZONS,
+    )
 
     metrics = {
         "alignment_info": alignment_info,
@@ -206,6 +284,11 @@ def main() -> None:
         baseline_curve=peg_pos_curve_solver24,
         nerd_curve=peg_pos_curve_nerd,
     )
+    error_vs_horizon_path = output_dir / "error_vs_horizon.png"
+    ensure_directory(error_vs_horizon_path)
+    plot_error_vs_horizon(ERROR_HORIZONS, solver24_horizon_errors, nerd_horizon_errors)
+    plt.savefig(error_vs_horizon_path)
+    plt.close()
 
     np.savez(
         output_dir / "comparison_curves.npz",
@@ -213,6 +296,9 @@ def main() -> None:
         state_mse_nerd=state_mse_curve_nerd,
         peg_pos_solver24=peg_pos_curve_solver24,
         peg_pos_nerd=peg_pos_curve_nerd,
+        error_horizons=np.asarray(ERROR_HORIZONS, dtype=np.int32),
+        error_vs_horizon_solver24=np.asarray(solver24_horizon_errors, dtype=np.float32),
+        error_vs_horizon_nerd=np.asarray(nerd_horizon_errors, dtype=np.float32),
         traj_lengths=traj_lengths,
     )
 
@@ -220,6 +306,11 @@ def main() -> None:
         "solver24_dataset": str(solver24_path.expanduser().resolve()),
         "solver192_dataset": str(solver192_path.expanduser().resolve()),
         "nerd_rollout": str(rollout_path.expanduser().resolve()),
+        "error_vs_horizon": {
+            "horizons": ERROR_HORIZONS,
+            "solver24_state_mae": [float(value) if np.isfinite(value) else None for value in solver24_horizon_errors],
+            "nerd_state_mae": [float(value) if np.isfinite(value) else None for value in nerd_horizon_errors],
+        },
         "metrics": metrics,
         "improvement": improvement,
         "verdict": verdict,
@@ -243,8 +334,16 @@ def main() -> None:
     ensure_directory(summary_txt)
     summary_txt.write_text(summary_text, encoding="utf-8")
 
+    print("Horizon | solver24 | NeRD", flush=True)
+    print("--------------------------------", flush=True)
+    for horizon, solver24_error, nerd_error in zip(ERROR_HORIZONS, solver24_horizon_errors, nerd_horizon_errors):
+        solver24_text = f"{solver24_error:.6f}" if np.isfinite(solver24_error) else "nan"
+        nerd_text = f"{nerd_error:.6f}" if np.isfinite(nerd_error) else "nan"
+        print(f"{horizon:<7} | {solver24_text:<8} | {nerd_text}", flush=True)
+
     print(summary_text, flush=True)
     print(f"Saved comparison metrics to: {output_dir / 'comparison_metrics.json'}", flush=True)
+    print(f"Saved error-vs-horizon plot to: {error_vs_horizon_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,17 @@
-"""Developer note:
-This collector is intended to consume the RL-Games policy trained under
-`/home/yiru-wu/Documents/learned_dynamics`.
+"""NeRD trajectory collector with peg-centric PhysX contact reports.
 
-Treat `/home/yiru-wu/Documents/learned_dynamics/play.py` as the primary
-reference for how the policy should be created, restored, and stepped for
-inference.
+This is the primary collector for the learned_dynamics project. It uses the
+low-level PhysX contact report immediate API to gather per-contact geometry
+from all peg-involving contacts (peg-vs-hole and peg-vs-robot).
 
-Unlike the existing collector path, this script uses the lower-level PhysX
-contact report immediate API to gather nonzero per-contact geometry for
-NeRD-friendly trajectory datasets.
+Saved data per timestep:
+- ``applied_joint_torque``: actual OSC joint torque sent to PhysX (not the
+  raw RL policy output). Read from ``robot.data.applied_torque`` after the
+  last physics substep, after ImplicitActuator effort-limit clipping.
+- ``contact_identities``: binary label per contact slot (0 = hole/environment,
+  1 = robot) indicating the other body in the peg-centric contact.
+- Per-contact geometry: normals, depths, points, impulses — top-K ranked by
+  impulse magnitude and aligned with ``contact_identities``.
 """
 
 from __future__ import annotations
@@ -88,6 +91,8 @@ def step_direct_env_with_contact_reports(
     snapshot_fn: Any,
     obs_to_torch_fn: Any,
     contact_extractor: PhysXContactReportExtractor,
+    robot_asset_name: str = "robot",
+    robot_joint_count: int = 7,
 ) -> tuple[StepResult, Any]:
     """Step a DirectRLEnv while collecting low-level PhysX contact reports.
 
@@ -103,18 +108,63 @@ def step_direct_env_with_contact_reports(
     direct_env._pre_physics_step(action)
     is_rendering = direct_env.sim.has_gui() or direct_env.sim.has_rtx_sensors()
 
+    # --- Timing instrumentation (set _PROFILE_STEP = True to enable) ---
+    _PROFILE_STEP = False
+    if _PROFILE_STEP:
+        import time as _time
+        _t_apply = 0.0; _t_write = 0.0; _t_sim = 0.0; _t_contact = 0.0; _t_update = 0.0
+
     for _ in range(direct_env.cfg.decimation):
         direct_env._sim_step_counter += 1
+
+        if _PROFILE_STEP:
+            _t0 = _time.perf_counter()
         direct_env._apply_action()
+        if _PROFILE_STEP:
+            _t1 = _time.perf_counter(); _t_apply += _t1 - _t0
+
         direct_env.scene.write_data_to_sim()
+        if _PROFILE_STEP:
+            _t2 = _time.perf_counter(); _t_write += _t2 - _t1
+
         direct_env.sim.step(render=False)
+        if _PROFILE_STEP:
+            _t3 = _time.perf_counter(); _t_sim += _t3 - _t2
+
         # Direct low-level PhysX report read from the just-finished substep.
         contact_extractor.capture_substep_reports()
+        if _PROFILE_STEP:
+            _t4 = _time.perf_counter(); _t_contact += _t4 - _t3
+
         if direct_env._sim_step_counter % direct_env.cfg.sim.render_interval == 0 and is_rendering:
             direct_env.sim.render()
         direct_env.scene.update(dt=direct_env.physics_dt)
+        if _PROFILE_STEP:
+            _t5 = _time.perf_counter(); _t_update += _t5 - _t4
 
+    if _PROFILE_STEP:
+        _t_end0 = _time.perf_counter()
     contacts = contact_extractor.end_step()
+    if _PROFILE_STEP:
+        _t_end1 = _time.perf_counter()
+        _t_endstep = _t_end1 - _t_end0
+        _total = _t_apply + _t_write + _t_sim + _t_contact + _t_update + _t_endstep
+        _stats = contact_extractor.last_debug_stats
+        print(
+            f"[PROFILE] apply={_t_apply*1e3:.1f}ms write={_t_write*1e3:.1f}ms "
+            f"sim={_t_sim*1e3:.1f}ms contact={_t_contact*1e3:.1f}ms "
+            f"update={_t_update*1e3:.1f}ms end_step={_t_endstep*1e3:.1f}ms "
+            f"total={_total*1e3:.1f}ms | headers={_stats.raw_header_count} "
+            f"matching={_stats.matching_contact_count}",
+            flush=True,
+        )
+    # --- End timing instrumentation ---
+
+    # Capture applied joint torque from the last physics substep, before any reset
+    # overwrites the torque buffers. This is the actual OSC torque sent to PhysX.
+    import torch as _torch
+    _robot_art = direct_env.scene.articulations[robot_asset_name]
+    _applied_joint_torque = _robot_art.data.applied_torque[:, :robot_joint_count].clone()
 
     direct_env.episode_length_buf += 1
     direct_env.common_step_counter += 1
@@ -159,6 +209,7 @@ def step_direct_env_with_contact_reports(
             truncated=truncated,
             extras=extras,
             next_snapshot=next_snapshot,
+            applied_joint_torque=_applied_joint_torque,
         ),
         contacts,
     )
@@ -222,13 +273,13 @@ def main() -> None:
             player.init_rnn()
 
         horizon = resolve_horizon(cfg, direct_env)
-        action_dim = int(wrapped_env.action_space.shape[0])
+        torque_dim = assembler.robot_joint_count
         storage_device = direct_env.device if (cfg.save_on_gpu_first and "cuda" in str(direct_env.device)) else "cpu"
         writer = build_writer(
             cfg=cfg,
             horizon=horizon,
             state_dim=assembler.state_dim,
-            action_dim=action_dim,
+            torque_dim=torque_dim,
             state_layout=assembler.layout_metadata,
             step_dt=float(direct_env.step_dt),
         )
@@ -247,12 +298,19 @@ def main() -> None:
             writer._file.attrs["contact_impulse_vectors_semantics"] = (
                 "3D impulse vector from PhysX contact report, direction follows contact_normals convention"
             )
+            writer._file.attrs["contact_identities_semantics"] = (
+                "peg-centric binary identity per contact slot: 0=hole/environment, 1=robot"
+            )
+            writer._file.attrs["applied_joint_torque_semantics"] = (
+                "actual joint torque applied to the robot arm via OSC, read from robot.data.applied_torque "
+                "after the last physics substep (after ImplicitActuator effort-limit clipping)"
+            )
         print("HDF5 writer initialized.", flush=True)
         episode_storage = EpisodeStorage(
             num_envs=direct_env.num_envs,
             horizon=horizon,
             state_dim=assembler.state_dim,
-            action_dim=action_dim,
+            torque_dim=torque_dim,
             contact_slots=cfg.contact_slot_count_k,
             storage_device=storage_device,
             save_root_body_q=cfg.save_root_body_q,
@@ -260,6 +318,7 @@ def main() -> None:
             save_contact_points_1=cfg.save_contact_points_1,
             save_contact_impulses=cfg.save_contact_impulses,
             save_contact_impulse_vectors=cfg.save_contact_impulse_vectors,
+            save_contact_identities=cfg.save_contact_identities,
         )
 
         total_env_steps = 0
@@ -274,6 +333,9 @@ def main() -> None:
         print(f"Contact slots K: {cfg.contact_slot_count_k}", flush=True)
         print(f"Enabled source contact report prims: {contact_extractor.enabled_source_contact_report_prims}", flush=True)
         print(f"Enabled target contact report prims: {contact_extractor.enabled_target_contact_report_prims}", flush=True)
+        print(f"Enabled robot contact report prims: {contact_extractor.enabled_robot_contact_report_prims}", flush=True)
+        print(f"PyTorch CPU threads: {torch.get_num_threads()}", flush=True)
+        print(f"PyTorch interop threads: {torch.get_num_interop_threads()}", flush=True)
 
         with torch.inference_mode():
             while writer.remaining_capacity > 0:
@@ -291,12 +353,14 @@ def main() -> None:
                     snapshot_fn=assembler.capture,
                     obs_to_torch_fn=player.obs_to_torch,
                     contact_extractor=contact_extractor,
+                    robot_asset_name=cfg.robot_asset_name,
+                    robot_joint_count=assembler.robot_joint_count,
                 )
 
                 transition = build_transition_batch(
                     current_snapshot=current_snapshot,
                     next_snapshot=step_result.next_snapshot,
-                    actions=applied_action,
+                    applied_joint_torque=step_result.applied_joint_torque,
                     contacts=contacts,
                     dones=step_result.dones,
                     terminated=step_result.terminated,
@@ -339,8 +403,8 @@ def main() -> None:
 
         if contact_extractor.total_matching_contacts_seen <= 0:
             raise RuntimeError(
-                "The low-level PhysX contact report collector finished without seeing any matching peg-vs-socket "
-                "contacts. The saved dataset would be invalid for NeRD."
+                "The low-level PhysX contact report collector finished without seeing any matching peg-involving "
+                "contacts (neither peg-vs-hole nor peg-vs-robot). The saved dataset would be invalid for NeRD."
             )
 
         print(
